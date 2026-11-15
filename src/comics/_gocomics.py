@@ -14,8 +14,8 @@ from inspect import unwrap
 from io import BytesIO
 from random import randint
 from unittest.mock import MagicMock
-from playwright.sync_api import (
-    sync_playwright,
+from playwright.async_api import (
+    async_playwright,
     Error as PlaywrightError,
     TimeoutError as PlaywrightTimeoutError,
 )
@@ -34,7 +34,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 _BASE_URL = "https://www.gocomics.com"
 
 
-def _launch_page(browser_type):
+async def _launch_page(browser_type):
     """
     Launches `browser_type` and opens a page that presents itself as a regular browser.
 
@@ -49,19 +49,21 @@ def _launch_page(browser_type):
         tuple: The launched browser, which the caller must close, and its page.
     """
     if browser_type.name != "chromium":
-        browser = browser_type.launch()
-        return browser, browser.new_page()
+        browser = await browser_type.launch()
+        return browser, await browser.new_page()
     try:
-        browser = browser_type.launch(channel="chromium")
+        browser = await browser_type.launch(channel="chromium")
     except PlaywrightError:
-        browser = browser_type.launch()
+        browser = await browser_type.launch()
     try:
-        probe = browser.new_page()
-        user_agent = probe.evaluate("navigator.userAgent").replace("HeadlessChrome", "Chrome")
-        probe.close()
-        return browser, browser.new_context(user_agent=user_agent).new_page()
+        probe = await browser.new_page()
+        user_agent = await probe.evaluate("navigator.userAgent").replace(
+            "HeadlessChrome", "Chrome"
+        )
+        await probe.close()
+        return browser, await browser.new_context(user_agent=user_agent).new_page()
     except Exception:
-        browser.close()
+        await browser.close()
         raise
 
 
@@ -244,7 +246,7 @@ class ComicsAPI:
             get_ipython
             display(image)
 
-    def stream(self, retries=5, base_delay=0.5):
+    async def stream(self, retries=5, base_delay=0.5):
         """
         Streams comic strip response.
 
@@ -260,10 +262,12 @@ class ComicsAPI:
         """
         # note: we don't need playwright to get image streams; which is good
         # because playwright doesn't let us get the raw bytes of the page anyways.
-        return self._get_response(self.image_url_with_retries(retries, base_delay), stream=True)
+        return self._get_response(
+            await self.image_url_with_retries(retries, base_delay), stream=True
+        )
 
     @property
-    def image_url(self):
+    async def image_url(self):
         """
         Returns comic strip image URL. Fetches page using Playwright first, then falls back to requests
         if Playwright is not forced; otherwise, raises PlaywrightError.
@@ -275,9 +279,9 @@ class ComicsAPI:
         Returns:
             str: Comic strip image URL.
         """
-        return self._extract_image_url_from_response(self._fetch_page())
+        return self._extract_image_url_from_response(await self._fetch_page())
 
-    def _fetch_page(self, bypass_cache=False):
+    async def _fetch_page(self, bypass_cache=False):
         """
         Fetches the comic strip page using Playwright, falling back to requests if Playwright
         is not forced.
@@ -293,19 +297,22 @@ class ComicsAPI:
         Returns:
             requests.models.Response: Response object for the comic strip page.
         """
-        get_playwright, get_requests = self._get_response_playwright, self._get_response
+        get_playwright, get_requests = (
+            self._get_response_playwright,
+            self._get_response,
+        )
         if bypass_cache:
             get_playwright = partial(unwrap(type(self)._get_response_playwright), self)
             get_requests = partial(unwrap(type(self)._get_response), self)
         try:
-            return get_playwright(self.url)
+            return await get_playwright(self.url)
         except (PlaywrightError, ComicsBlockedError) as ex:
             if self._force_playwright is True:
                 # Preserve original Playwright error message for visibility
                 raise ComicsPlaywrightError(str(ex)) from ex
             return get_requests(self.url)
 
-    def image_url_with_retries(self, retries=5, base_delay=0.5):
+    async def image_url_with_retries(self, retries=5, base_delay=0.5):
         """
         Retry wrapper for image_url property. A ComicsBlockedError is not retried.
 
@@ -324,7 +331,9 @@ class ComicsAPI:
         # Retry logic for image_url property
         for i in range(retries + 1):
             try:
-                return self._extract_image_url_from_response(self._fetch_page(bypass_cache=i > 0))
+                return self._extract_image_url_from_response(
+                    await self._fetch_page(bypass_cache=i > 0)
+                )
             # Handle specific InvalidDateError to retry
             except InvalidDateError:
                 if i < retries:
@@ -375,7 +384,8 @@ class ComicsAPI:
         # If not found, try extracting image URL from ld+json script tag within the correct container
         viewer_div = comic_html.find(
             "div",
-            class_=lambda c: c and c.startswith("ShowComicViewer_showComicViewer__comic"),
+            class_=lambda c: c
+            and c.startswith("ShowComicViewer_showComicViewer__comic"),
         )
         if viewer_div:
             script_tag = viewer_div.find("script", type="application/ld+json")
@@ -404,7 +414,7 @@ class ComicsAPI:
 
     @bypass_comics_cache
     @lru_cache(maxsize=128)
-    def _get_response_playwright(self, url):
+    async def _get_response_playwright(self, url):
         """
         Gets response for queried GoComics URL (using PlayWright).
 
@@ -418,7 +428,7 @@ class ComicsAPI:
         Returns:
             requests.models.Response: Response object for the queried URL.
         """
-        with sync_playwright() as p:
+        async with async_playwright() as p:
             # Try any of the following browsers. If one of them succeeds, go ahead; otherwise collect the last error.
             browsers = [p.webkit, p.firefox, p.chromium]
             last_error = None
@@ -426,31 +436,37 @@ class ComicsAPI:
             for browser in browsers:
                 launched_browser = None
                 try:
-                    launched_browser, page = _launch_page(browser)
+                    launched_browser, page = await _launch_page(browser)
                     # Explicit timeout prevents indefinite hangs in CI (default is 30s per action).
-                    r = page.goto(url, timeout=15000)
+                    r = await page.goto(url, timeout=15000)
                     if r is not None:
                         # BunnyCDN serves its JS proof-of-work challenge with HTTP 403 (it used
                         # to be 200). The challenge page sets data-pow on <body>; the real
                         # comic page does not. We wait until it disappears, which signals the
                         # PoW was submitted and the CDN redirected back to the actual page.
-                        if page.evaluate("document.body.hasAttribute('data-pow')"):
+                        if await page.evaluate(
+                            "document.body.hasAttribute('data-pow')"
+                        ):
                             try:
                                 page.wait_for_function(
                                     "() => !document.body.hasAttribute('data-pow')",
                                     timeout=20000,
                                 )
                             except PlaywrightTimeoutError:
-                                blocked.append(f"{browser.name}: challenge did not clear")
+                                blocked.append(
+                                    f"{browser.name}: challenge did not clear"
+                                )
                                 continue
                             # page.content() raises while the redirect is still navigating.
                             page.wait_for_load_state("domcontentloaded")
                         elif 400 <= r.status < 600:
-                            print(f"HTTP error {r.status} for {url} with {browser.name}")
+                            print(
+                                f"HTTP error {r.status} for {url} with {browser.name}"
+                            )
                             if r.status in (403, 429):
                                 blocked.append(f"{browser.name}: HTTP {r.status}")
                             continue
-                        st = page.content()
+                        st = await page.content()
                         resp = MagicMock(spec=Response)
                         resp.status_code = 400
                         resp.text = st
@@ -462,7 +478,7 @@ class ComicsAPI:
                 finally:
                     if launched_browser is not None:
                         with contextlib.suppress(Exception):
-                            launched_browser.close()
+                            await launched_browser.close()
 
             if blocked:
                 raise ComicsBlockedError(
